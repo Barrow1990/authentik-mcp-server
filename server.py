@@ -6,16 +6,56 @@ provider / SSO) operations as MCP tools, so an MCP-compatible AI assistant
 (e.g. Claude Code / Claude Desktop) can look up users, groups, applications,
 and recent auth events, and check system status via Authentik's REST API.
 
+This image runs in one of two MODES, chosen at startup by AUTHENTIK_MCP_MODE
+(default "read" — the safe default). Both modes come from this same file and
+image; which one a given container is depends entirely on this one variable:
+
+  read   Every tool except set_user_active. This is the only mode where the
+         write tool doesn't exist — not gated, not hidden, genuinely absent
+         from this process's tool registry, so it can't be discovered or
+         called no matter what a client asks for.
+  write  Everything read mode has, PLUS set_user_active — itself still
+         gated by AUTHENTIK_ALLOW_WRITES + confirm=True (see below). This
+         mode exists so a deployment can choose to run it only when a write
+         is actually intended, rather than have every deployment carry
+         write capability by default.
+
+Run both from the same image as two separate containers (see
+docker-compose.yml) — normal day-to-day tool use only ever talks to the read
+container; the write container is a deliberate, separate thing to stand up
+(or leave running behind its own bearer token) only when you actually want
+an assistant to be able to flip a user's active flag.
+
 Configuration is via environment variables:
-  AUTHENTIK_URL        e.g. http://192.168.1.50:9000 (required)
-  AUTHENTIK_API_TOKEN  Authentik > Directory > Tokens and App passwords >
-                        Create, Intent = API Token (required)
-  MCP_HOST             interface to bind to (default 0.0.0.0)
-  MCP_PORT             port to listen on (default 8937)
-  MCP_AUTH_TOKEN       shared secret required as `Authorization: Bearer <token>`
-                        on every request (optional — if unset, the server is open
-                        to anyone who can reach it; see README for why that's a
-                        real trade-off, not just a default to ignore)
+  AUTHENTIK_MCP_MODE        "read" or "write" (default "read")
+  AUTHENTIK_URL             e.g. http://192.168.1.50:9000 (required)
+  AUTHENTIK_API_TOKEN_READ  token used when AUTHENTIK_MCP_MODE=read
+  AUTHENTIK_API_TOKEN_WRITE token used when AUTHENTIK_MCP_MODE=write
+  AUTHENTIK_API_TOKEN       fallback used if the mode-specific variable
+                            above isn't set (simplest option if you're happy
+                            with one token covering both modes; see below
+                            for why two separately-scoped tokens are safer)
+  AUTHENTIK_ALLOW_WRITES    write-mode-only master switch for set_user_active
+                            (default false — see below)
+  MCP_HOST                  interface to bind to (default 0.0.0.0)
+  MCP_PORT                  port to listen on (default 8937 in read mode,
+                            8942 in write mode)
+  MCP_AUTH_TOKEN_READ / MCP_AUTH_TOKEN_WRITE / MCP_AUTH_TOKEN
+                            shared secret required as `Authorization: Bearer
+                            <token>` on every request, resolved the same way
+                            as the AUTHENTIK_API_TOKEN_* family above
+                            (optional — if none is set, the server is open
+                            to anyone who can reach it; see README)
+
+Recommended setup: create two separate Authentik service accounts, one
+scoped to view_* permissions only (used as AUTHENTIK_API_TOKEN_READ) and one
+that also has authentik_core.change_user (used as AUTHENTIK_API_TOKEN_WRITE).
+That way even a full compromise of the read container's process (env vars,
+memory, whatever) never yields a credential capable of writing anything —
+the separation is enforced by Authentik's own RBAC, not just by this code
+choosing not to register a tool. Two distinct MCP_AUTH_TOKEN_* values
+similarly mean a leaked read-side bearer secret can't be replayed against
+the write container's port at all.
 
 Authentik's API is versioned as a fixed path prefix (/api/v3/...), not
 content-negotiated or discoverable at runtime the way the Servarr apps
@@ -25,19 +65,11 @@ the client's base_url below. A future Authentik v4 would need a code change
 in this file; there's no automated drift detection for it the way
 sonarr-mcp-server/radarr-mcp-server have for their API version.
 
-Scope is deliberately read-mostly: this server manages access to real user
-accounts, groups, and SSO application configuration in a running identity
-provider, so the blast radius of a wrong or malicious tool call is much
-higher than for a media manager. Every tool here is read-only except
-`set_user_active`, which only flips a user's enabled/disabled flag — a
-reversible, low-risk action. There is deliberately no create/delete tool for
-users, groups, applications, or anything else. See README.md's "Why no
-destructive tools" section.
-
-`set_user_active` — and any write tool added to this server in future — is
-gated by two independent opt-ins, neither of which is on by default:
+`set_user_active`, in write mode, is additionally gated by two independent
+opt-ins on top of the mode split above, neither of which is on by default:
   1. AUTHENTIK_ALLOW_WRITES=true in the environment (server-level: the
-     operator running this container has to deliberately turn writes on).
+     operator running this specific container has to deliberately turn
+     writes on, even though it's already the write-mode image).
   2. confirm=True passed on the tool call itself (call-level: an assistant
      can't trigger it via a misread instruction or a stale default; the
      caller has to explicitly ask for the write, every time).
@@ -77,12 +109,39 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _mode_scoped_env(base_name: str, mode: str) -> str | None:
+    """Resolve `{base_name}_{MODE}` first, falling back to plain `{base_name}`.
+
+    Lets a deployment give the read and write containers genuinely different
+    credentials/secrets (recommended — see module docstring) while still
+    working with just one plain variable for anyone who doesn't need that
+    separation."""
+    return os.environ.get(f"{base_name}_{mode.upper()}") or os.environ.get(base_name)
+
+
+def _require_mode_scoped_env(base_name: str, mode: str) -> str:
+    value = _mode_scoped_env(base_name, mode)
+    if not value:
+        print(
+            f"error: required environment variable {base_name}_{mode.upper()} "
+            f"(or {base_name}) is not set",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return value
+
+
+AUTHENTIK_MCP_MODE = os.environ.get("AUTHENTIK_MCP_MODE", "read").lower()
+if AUTHENTIK_MCP_MODE not in ("read", "write"):
+    print(f"error: AUTHENTIK_MCP_MODE must be 'read' or 'write', got {AUTHENTIK_MCP_MODE!r}", file=sys.stderr)
+    sys.exit(1)
+
 AUTHENTIK_URL = _require_env("AUTHENTIK_URL").rstrip("/")
-AUTHENTIK_API_TOKEN = _require_env("AUTHENTIK_API_TOKEN")
+AUTHENTIK_API_TOKEN = _require_mode_scoped_env("AUTHENTIK_API_TOKEN", AUTHENTIK_MCP_MODE)
 AUTHENTIK_ALLOW_WRITES = os.environ.get("AUTHENTIK_ALLOW_WRITES", "").lower() in ("1", "true", "yes")
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "8937"))
-MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8937" if AUTHENTIK_MCP_MODE == "read" else "8942"))
+MCP_AUTH_TOKEN = _mode_scoped_env("MCP_AUTH_TOKEN", AUTHENTIK_MCP_MODE)
 
 client = httpx.Client(
     base_url=f"{AUTHENTIK_URL}/api/v3",
@@ -90,7 +149,7 @@ client = httpx.Client(
     timeout=30,
 )
 
-mcp = MCPServer("authentik")
+mcp = MCPServer(f"authentik-{AUTHENTIK_MCP_MODE}")
 
 
 @mcp.tool()
@@ -199,28 +258,35 @@ def recent_events(username: str | None = None, action: str | None = None, limit:
     ]
 
 
-@mcp.tool()
-def set_user_active(user_id: int, is_active: bool, confirm: bool = False) -> str:
-    """Enable or disable an Authentik user account. Reversible — does not delete anything.
+# set_user_active only exists as an attribute of this module — let alone as
+# a registered MCP tool — when AUTHENTIK_MCP_MODE=write. In read mode there
+# is no code path that defines it at all, so it can't be listed, discovered,
+# or called regardless of what a client sends; this isn't an extra check
+# guarding the function, it's the function simply not existing.
+if AUTHENTIK_MCP_MODE == "write":
 
-    Guarded: requires AUTHENTIK_ALLOW_WRITES=true in the server's environment
-    AND confirm=True on this call. Both are off by default; call with
-    confirm=True only once you actually mean to flip this user's access."""
-    if not AUTHENTIK_ALLOW_WRITES:
-        raise PermissionError(
-            "set_user_active is disabled: set AUTHENTIK_ALLOW_WRITES=true in the "
-            "server's environment to enable write tools on this server"
-        )
-    if not confirm:
-        raise ValueError(
-            "set_user_active requires confirm=True — this is a deliberate second "
-            "guard on top of AUTHENTIK_ALLOW_WRITES, not a bug"
-        )
+    @mcp.tool()
+    def set_user_active(user_id: int, is_active: bool, confirm: bool = False) -> str:
+        """Enable or disable an Authentik user account. Reversible — does not delete anything.
 
-    response = client.patch(f"/core/users/{user_id}/", json={"is_active": is_active})
-    response.raise_for_status()
-    state = "enabled" if is_active else "disabled"
-    return f"User {user_id} {state}"
+        Guarded: requires AUTHENTIK_ALLOW_WRITES=true in the server's environment
+        AND confirm=True on this call. Both are off by default; call with
+        confirm=True only once you actually mean to flip this user's access."""
+        if not AUTHENTIK_ALLOW_WRITES:
+            raise PermissionError(
+                "set_user_active is disabled: set AUTHENTIK_ALLOW_WRITES=true in the "
+                "server's environment to enable write tools on this server"
+            )
+        if not confirm:
+            raise ValueError(
+                "set_user_active requires confirm=True — this is a deliberate second "
+                "guard on top of AUTHENTIK_ALLOW_WRITES, not a bug"
+            )
+
+        response = client.patch(f"/core/users/{user_id}/", json={"is_active": is_active})
+        response.raise_for_status()
+        state = "enabled" if is_active else "disabled"
+        return f"User {user_id} {state}"
 
 
 @mcp.tool()
@@ -285,6 +351,7 @@ async def ready(request: Request) -> Response:
             "status": "ok",
             "reachable": True,
             "authenticated": True,
+            "mode": AUTHENTIK_MCP_MODE,
             "authentik": {"url": AUTHENTIK_URL, "username": whoami.get("username")},
         }
     )

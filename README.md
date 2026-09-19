@@ -9,109 +9,150 @@ so any MCP client on your internal network can connect to
 container lifecycle/updates can be handed off to a tool like
 [Dockhand](https://dockhand.pro).
 
+## Two modes, one image
+
+This image can run as either of two containers, chosen by `AUTHENTIK_MCP_MODE`:
+
+| Mode | Port (default) | Tools |
+|---|---|---|
+| `read` (default) | 8937 | Everything except `set_user_active` |
+| `write` | 8942 | Everything `read` has, **plus** `set_user_active` |
+
+This is not a config toggle guarding one shared codebase — in `read` mode,
+`set_user_active` is never defined at all, so it can't appear in a tool
+listing or be called under any circumstances. `docker-compose.yml` runs
+`read` always-on and puts `write` behind a Compose profile, so a plain
+`docker compose up -d` only ever starts something that structurally cannot
+write to your identity provider. Starting the write container is a
+deliberate, separate action: `docker compose --profile write up -d`.
+
 ## Tools
 
-| Tool | Description |
-|---|---|
-| `list_users` | List users, optionally filtered by search term and/or active status |
-| `user_details` | Full details for one user by ID |
-| `list_groups` | List groups, optionally filtered by name |
-| `list_applications` | List configured SSO applications |
-| `recent_events` | Recent audit/auth events (logins, failures, config changes, ...) |
-| `set_user_active` | Enable or disable a user account |
-| `system_status` | Authentik version and runtime info |
+| Tool | Mode | Description |
+|---|---|---|
+| `list_users` | read, write | List users, optionally filtered by search term and/or active status |
+| `user_details` | read, write | Full details for one user by ID |
+| `list_groups` | read, write | List groups, optionally filtered by name |
+| `list_applications` | read, write | List configured SSO applications |
+| `recent_events` | read, write | Recent audit/auth events (logins, failures, config changes, ...) |
+| `system_status` | read, write | Authentik version and runtime info |
+| `set_user_active` | **write only** | Enable or disable a user account |
 
 ### Why no destructive tools
 
 Authentik is an identity provider — it holds real user accounts, group
 membership, and SSO/application configuration for everything else behind it.
 A wrong or malicious tool call here has a much bigger blast radius than one
-against a media manager, so this server is deliberately read-mostly:
+against a media manager, so this server is deliberately read-mostly, with
+writes isolated behind several independent layers rather than one flag:
 
-- Every tool is read-only **except** `set_user_active`, which only flips a
-  user's enabled/disabled flag. That's reversible (flip it back) and covers
-  the actual homelab use case ("disable this account") without exposing
-  anything sharper.
-- `set_user_active` is additionally gated by two independent opt-ins, both
-  off by default: `AUTHENTIK_ALLOW_WRITES=true` in the server's environment
-  (an operator decision), and `confirm=True` on the call itself (a per-call
-  decision). Either missing raises a clear error rather than silently doing
-  nothing — see Configuration below.
-- There is **no** create/delete tool for users, groups, applications,
-  providers, or flows, and no tool that touches password hashes, tokens, or
-  recovery links, even though Authentik's API supports all of that
-  (`set_password`, `recovery`, `impersonate`, etc. on the users endpoint).
-  If you need those, use Authentik's own admin UI.
-- `recent_events` is read-only but still sensitive — audit events can include
-  IPs and usernames tied to real login activity. Scope who can reach this
-  server's `/mcp` endpoint accordingly (see Authentication, below).
+1. **Mode split (structural).** `set_user_active` only exists in write-mode
+   containers. Point a client at the read-mode server and the tool is
+   genuinely absent — not hidden, not permission-denied, just not there.
+2. **`AUTHENTIK_ALLOW_WRITES=true`** — even in a write-mode container, this
+   must be explicitly set (default `false`). An operator has to turn writes
+   on for that specific deployment.
+3. **`confirm=True`** on the call itself — an assistant has to explicitly
+   ask for the write every time; it can't happen from a misread instruction
+   or a config left at its default.
+4. **Separate credentials recommended** (see Configuration below): give the
+   read and write containers different, separately-scoped Authentik API
+   tokens and different `MCP_AUTH_TOKEN`s, so a compromise of the read
+   container's environment doesn't hand over write-capable credentials too.
+
+Beyond `set_user_active`, there is **no** create/delete tool for users,
+groups, applications, providers, or flows, and no tool that touches password
+hashes, tokens, or recovery links, even though Authentik's API supports all
+of that (`set_password`, `recovery`, `impersonate`, etc. on the users
+endpoint). If you need those, use Authentik's own admin UI.
+
+`recent_events` is read-only but still sensitive — audit events can include
+IPs and usernames tied to real login activity. Scope who can reach either
+server's `/mcp` endpoint accordingly (see Authentication, below).
 
 If you want more capability than this, treat it as a deliberate decision to
-widen scope, not a missing feature — add tools individually and mind the
-permission each one needs (see Configuration below).
+widen scope, not a missing feature — add tools individually, decide which
+mode they belong in, and mind the permission each one needs.
 
 ## Health endpoints
 
-Two plain HTTP endpoints, reachable without `MCP_AUTH_TOKEN` (so Docker's
-`HEALTHCHECK`, Dockhand, or any other monitor can poll them without the
-secret):
+Two plain HTTP endpoints per container, reachable without `MCP_AUTH_TOKEN`
+(so Docker's `HEALTHCHECK`, Dockhand, or any other monitor can poll them
+without the secret):
 
 | Endpoint | Checks | Healthy | Unhealthy |
 |---|---|---|---|
 | `GET /health` | The process is up and serving HTTP. Does **not** call Authentik. | `200 {"status": "ok"}` | (doesn't respond) |
-| `GET /ready` | `AUTHENTIK_URL` is reachable and `AUTHENTIK_API_TOKEN` is valid (via `GET /core/users/me/`, which any valid token can call regardless of its other permissions). | `200 {"status": "ok", "reachable": true, "authenticated": true, "authentik": {...}}` | `503 {"status": "error", "reachable": ..., "authenticated": ..., "error": "..."}` |
+| `GET /ready` | `AUTHENTIK_URL` is reachable and the mode's API token is valid (via `GET /core/users/me/`, which any valid token can call regardless of its other permissions). | `200 {"status": "ok", "reachable": true, "authenticated": true, "mode": "read"\|"write", "authentik": {...}}` | `503 {"status": "error", "reachable": ..., "authenticated": ..., "error": "..."}` |
 
-They're split deliberately: `/health` is what the container's own
+They're split deliberately: `/health` is what each container's own
 `HEALTHCHECK` uses (so a transient Authentik outage doesn't get the
 container itself restarted in a loop), while `/ready` is for verifying
-config — after changing `AUTHENTIK_URL`/`AUTHENTIK_API_TOKEN`,
-`curl http://<host>:8937/ready` tells you plainly whether the host is
-reachable, the token is valid, or both.
+config — `curl http://<host>:8937/ready` (read) or
+`curl http://<host>:8942/ready` (write) tells you plainly whether that
+container's host is reachable, its token is valid, or both. The response's
+`mode` field confirms which container answered.
 
 `/ready` deliberately checks token *validity*, not the specific permissions
 individual tools need. `system_status` needs the
 `authentik_rbac.view_system_info` permission and `set_user_active` needs
 write access to users; a `403` from either of those is a permission-scope
-problem with the token, not a readiness failure — `/ready` will still report
-healthy as long as the token can authenticate at all.
+problem with that container's token, not a readiness failure — `/ready` will
+still report healthy as long as the token can authenticate at all.
 
 ## Authentication
 
-Set `MCP_AUTH_TOKEN` (a random shared secret — `openssl rand -hex 32`) and
-every request must carry `Authorization: Bearer <token>` or the server
-returns `401`. This is checked by a small Starlette middleware in front of
-the MCP app, **not** the `mcp` SDK's built-in OAuth support
-(`mcp.server.auth`) — that machinery expects a full OAuth authorization
-server (issuer/resource metadata, RFC 8414/8707/9068 discovery), which is
-unnecessary complexity for one secret shared by trusted LAN clients.
+Set `MCP_AUTH_TOKEN_READ` and `MCP_AUTH_TOKEN_WRITE` (random shared secrets —
+`openssl rand -hex 32` each) and every request to the corresponding
+container must carry `Authorization: Bearer <that container's token>` or it
+returns `401`. Use **two different values** — that's what stops a leaked
+read-side bearer token from being replayed against the write container's
+port. This is checked by a small Starlette middleware in front of the MCP
+app, **not** the `mcp` SDK's built-in OAuth support (`mcp.server.auth`) —
+that machinery expects a full OAuth authorization server (issuer/resource
+metadata, RFC 8414/8707/9068 discovery), which is unnecessary complexity for
+a secret shared by trusted LAN clients.
 
-Leave `MCP_AUTH_TOKEN` unset and the server runs with **no auth** — anything
-that can reach `http://<host>:<port>/mcp` can call every tool, including
-`set_user_active` and `list_users`. Given what this server has access to
-(every user account in your identity provider), running without
-`MCP_AUTH_TOKEN` is a materially bigger risk here than for the media-manager
-MCP servers in this same family — set it. The server logs a warning on
-startup when it's running without one. Either way, the trust boundary is
-still the network:
+Leave a container's token unset and **that container** runs with no auth —
+anything that can reach its `/mcp` endpoint can call every tool it exposes.
+For the write container that includes `set_user_active` (still behind
+`AUTHENTIK_ALLOW_WRITES` + `confirm=True`, but still — set the token). Each
+container logs a warning on startup when it's running without one. Either
+way, the trust boundary is still the network:
 
-- **Do not** publish this port through any reverse proxy, port-forward, or
-  anything else reachable from outside your LAN/VLAN — the bearer token
-  protects against anyone *on* the network, not against the open internet.
+- **Do not** publish either port through any reverse proxy, port-forward, or
+  anything else reachable from outside your LAN/VLAN.
 - Bind the compose `ports:` mapping to a specific internal interface (e.g.
   `192.168.1.50:8937:8937`) rather than all interfaces, if you want to be
   stricter about which hosts on your network can reach it at all.
 
-### AUTHENTIK_API_TOKEN scope
+### Authentik API token scope — use two, not one
 
-Create a dedicated service account in Authentik (Directory > Users > Create
-Service Account) rather than reusing your own admin user, then create its
-API token under Directory > Tokens and App passwords (Intent: API Token).
-Grant that service account only the RBAC permissions the tools you actually
-use need — at minimum `authentik_core.view_user` for `list_users`/
-`user_details`, plus `view_group`/`view_application`/`view_event` for the
-other read tools, `authentik_core.change_user` if you want `set_user_active`
-to work, and `authentik_rbac.view_system_info` for `system_status`. A full
-superuser token works too but grants far more than this server needs.
+Create **two separate** service accounts in Authentik (Directory > Users >
+Create Service Account) rather than reusing your own admin user, or reusing
+one account for both modes. Create each one's API token under Directory >
+Tokens and App passwords (Intent: API Token):
+
+- **Read token** (`AUTHENTIK_API_TOKEN_READ`): grant only `view_user`,
+  `view_group`, `view_application`, `view_event`, and
+  `authentik_rbac.view_system_info` — whatever the read tools you actually
+  use need. This account should have **no** write permissions on anything.
+- **Write token** (`AUTHENTIK_API_TOKEN_WRITE`): the above, plus
+  `authentik_core.change_user` for `set_user_active`.
+
+Don't rely on assumed defaults for what a fresh service account or API
+token can and can't do — Authentik's permission model has changed across
+versions (see the RBAC/permissions docs for your installed version), and
+what a token can do depends on the role/group it's actually assigned, not
+just on it being newly created. Check the token's effective permissions
+directly in Authentik's admin UI after creating it, for both accounts.
+
+This is the layer that actually matters most: even a full compromise of the
+read container's process — its environment, its memory, everything — can't
+yield a credential capable of writing anything, because Authentik's own RBAC
+enforces that, not just this server's tool registry. A single
+`AUTHENTIK_API_TOKEN` (no `_READ`/`_WRITE` suffix) is supported as a fallback
+if you'd rather use one token for both, but that gives up this guarantee.
 
 ## Configuration
 
@@ -119,12 +160,14 @@ Environment variables (see `.env.example`):
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `AUTHENTIK_MCP_MODE` | no | `read` | `read` or `write` — see "Two modes, one image" above |
 | `AUTHENTIK_URL` | yes | — | e.g. `http://192.168.1.50:9000` (or your reverse-proxied HTTPS URL) |
-| `AUTHENTIK_API_TOKEN` | yes | — | Bearer token from Directory > Tokens and App passwords |
-| `AUTHENTIK_ALLOW_WRITES` | no | `false` | Master switch for `set_user_active`. Must be `true` *and* the call must pass `confirm=True` — both gates are required |
+| `AUTHENTIK_API_TOKEN_READ` | yes, in read mode | — | Falls back to plain `AUTHENTIK_API_TOKEN` if unset |
+| `AUTHENTIK_API_TOKEN_WRITE` | yes, in write mode | — | Falls back to plain `AUTHENTIK_API_TOKEN` if unset |
+| `AUTHENTIK_ALLOW_WRITES` | no | `false` | Write-mode-only master switch for `set_user_active`. Must be `true` *and* the call must pass `confirm=True` |
 | `MCP_HOST` | no | `0.0.0.0` | Interface the server binds to inside the container |
-| `MCP_PORT` | no | `8937` | Port the server listens on |
-| `MCP_AUTH_TOKEN` | no | — | Shared secret required as `Authorization: Bearer <token>`. Unset = no auth (see above) |
+| `MCP_PORT` | no | `8937` (read) / `8942` (write) | Port the server listens on |
+| `MCP_AUTH_TOKEN_READ` / `MCP_AUTH_TOKEN_WRITE` | no | — | Per-mode bearer secret. Falls back to plain `MCP_AUTH_TOKEN` if unset. Unset entirely = no auth on that container (see above) |
 
 Authentik's REST API is a fixed path prefix (`/api/v3/...`) rather than
 content-negotiated or runtime-discoverable the way the Servarr apps
@@ -141,9 +184,10 @@ API version bump.
 
 Built and pushed to `ghcr.io/barrow1990/authentik-mcp-server` by
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on every push to
-`main` that passes tests, tagged `:latest` and `:<commit-sha>`.
-`docker-compose.yml` pulls `:latest` by default; swap in `build: .` there
-instead if you'd rather build locally from the `Dockerfile`.
+`main` that passes tests, tagged `:latest` and `:<commit-sha>`. The same
+image serves both modes — `docker-compose.yml` runs it twice with different
+`AUTHENTIK_MCP_MODE` values. Swap in `build: .` there instead if you'd
+rather build locally from the `Dockerfile`.
 
 The image is a three-stage build: `builder` compiles dependencies into
 `--target=/deps` (all of them, including `cryptography`'s compiled `cffi`
@@ -168,22 +212,54 @@ was actually tested.
 ## Running with Docker Compose
 
 ```bash
-cp .env.example .env   # fill in AUTHENTIK_URL / AUTHENTIK_API_TOKEN
-docker compose up -d --pull always
+cp .env.example .env   # fill in AUTHENTIK_URL and both API tokens
+docker compose up -d --pull always              # read container only
+docker compose --profile write up -d            # also starts the write container
 ```
 
-The server is then reachable at `http://<docker-host>:8937/mcp` from anything
-on your internal network.
+The read server is reachable at `http://<docker-host>:8937/mcp`; the write
+server, once started, at `http://<docker-host>:8942/mcp`.
 
-## Managing with Dockhand
+## One `.env`, but no container sees more than its own variables
 
-Point Dockhand at `ghcr.io/barrow1990/authentik-mcp-server` and let it track
-new tags — this is the registry-pull model Dockhand's image-update tracking
-(Grype/Trivy scans, tag tracking, scheduled updates) is actually built
-around. The alternative, pointing Dockhand at this repo as a Git-deployed
-Compose stack with `build: .`, works too, but syncing new Git commits does
-**not** imply rebuilding the image — those are two separate steps for a
-build-from-source stack.
+`docker-compose.yml` deliberately does **not** use `env_file:` (which would
+dump the whole `.env` into every container). Instead each service's
+`environment:` block names its own variables explicitly via `${VAR}`
+substitution — a variable never referenced in a service's block simply never
+reaches that container. Verify this yourself any time after editing `.env`:
+
+```bash
+docker compose --profile write config
+```
+
+`authentik-mcp-read`'s resolved environment should show `AUTHENTIK_API_TOKEN_READ`
+but never `AUTHENTIK_API_TOKEN_WRITE` or `MCP_AUTH_TOKEN_WRITE` — confirmed
+during development of this compose file, but re-check it after any edit,
+since a typo in a service's `environment:` block would silently reintroduce
+exactly the leak this design exists to prevent.
+
+### Does this fit how Dockhand expects to be used?
+
+**Only if Dockhand feeds `docker compose` a plain `.env`.** `${VAR}`
+substitution reads exclusively from a literal `.env` in the project
+directory (or `--env-file <path>` / real shell environment variables) —
+never from an arbitrarily-named file. This is a change from how earlier
+servers in this family (sonarr, radarr, ...) load config — those use
+`env_file: [.env, .env.dockhand]` on the understanding that Dockhand writes
+its UI-configured values to a separate `.env.dockhand`, which `env_file:`
+(unlike substitution) can load regardless of filename.
+
+This repo hasn't been verified against a live Dockhand deployment. Before
+relying on it under Dockhand:
+
+1. Deploy this stack in Dockhand and check whether the values you set in
+   its UI actually reach the containers — `docker exec authentik-mcp-read env`.
+2. If they don't (Dockhand is writing to `.env.dockhand`, substitution never
+   sees it, and the `:?` markers in `docker-compose.yml` make `docker
+   compose up` fail outright rather than start with empty credentials): edit
+   `.env` directly in this repo's checkout instead of through Dockhand's UI,
+   or check whether Dockhand's stack settings let you point it at `.env`
+   instead of `.env.dockhand`.
 
 **Make the GHCR package public**, or every pull will need `docker login
 ghcr.io` with a PAT on each deploy host — a private package by default
@@ -191,24 +267,10 @@ requires auth even to `docker pull`, which most homelab boxes won't have
 configured.
 
 Set a restart policy of `unless-stopped` (already in `docker-compose.yml`) so
-Dockhand-driven restarts and host reboots bring it back up without manual
-intervention. The `HEALTHCHECK` in the `Dockerfile` (`GET /health`) drives
-Docker's/Dockhand's container health status; use `GET /ready` (see above)
-separately if you want to alert on Authentik connectivity specifically
-rather than container liveness.
-
-**Environment variables in Dockhand**: `docker-compose.yml` loads
-`AUTHENTIK_URL`/`AUTHENTIK_API_TOKEN`/`MCP_AUTH_TOKEN` via
-`env_file: [.env, .env.dockhand]` (both optional; `.env.dockhand` loads
-second, so it wins for any key it also sets). This is deliberate — a
-Git-deployed stack's `.env` is whatever's checked out from the repo (i.e.
-`.env.example`'s placeholders, since real `.env` is gitignored and not
-committed), while Dockhand writes the values you configure in its UI to
-`.env.dockhand` instead. If you set `AUTHENTIK_URL` in Dockhand's UI and the
-container is still using a placeholder, check that Dockhand is actually
-writing to `.env.dockhand` in the stack directory (not some other file) and
-that a rebuild has run since — a synced Git file change alone doesn't
-rebuild the image; see `GET /ready` to confirm what's live.
+Dockhand-driven restarts and host reboots bring the read container back up
+without manual intervention. The write container, being profile-gated, needs
+its profile invoked again after a host reboot too — that's intentional, not
+a bug to fix; it's meant to require a deliberate action to bring back.
 
 ## Connecting a client
 
@@ -216,9 +278,19 @@ rebuild the image; see `GET /ready` to confirm what's live.
 
 ```bash
 claude mcp add authentik -s user --transport http http://<docker-host>:8937/mcp \
-  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN_READ>"
 ```
-(Drop the `--header` flag if you're running with `MCP_AUTH_TOKEN` unset.)
+
+Add the write server as a **separate**, explicitly-named connection only
+when you actually want it available, rather than always-on alongside the
+read one:
+
+```bash
+claude mcp add authentik-write -s user --transport http http://<docker-host>:8942/mcp \
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN_WRITE>"
+```
+(Drop the `--header` flag on either if you're running that container with
+its token unset.)
 
 ### Claude Desktop
 
@@ -233,7 +305,7 @@ a network server like this you'll need an HTTP-to-stdio bridge such as
       "command": "npx",
       "args": [
         "-y", "mcp-remote", "http://<docker-host>:8937/mcp",
-        "--header", "Authorization: Bearer <MCP_AUTH_TOKEN>"
+        "--header", "Authorization: Bearer <MCP_AUTH_TOKEN_READ>"
       ]
     }
   }
@@ -244,8 +316,9 @@ a network server like this you'll need an HTTP-to-stdio bridge such as
 
 ```bash
 pip install -r requirements.txt
-AUTHENTIK_URL=http://192.168.1.50:9000 AUTHENTIK_API_TOKEN=your-api-token \
-MCP_AUTH_TOKEN=your-shared-secret python server.py
+AUTHENTIK_URL=http://192.168.1.50:9000 AUTHENTIK_MCP_MODE=read \
+AUTHENTIK_API_TOKEN_READ=your-read-scoped-token \
+MCP_AUTH_TOKEN_READ=your-shared-secret python server.py
 ```
 
 ## Testing
@@ -256,10 +329,18 @@ python -m pytest tests/ -v
 ```
 
 - `tests/test_tools.py` — each tool's logic against a mocked Authentik
-  (`httpx.MockTransport`, no extra mocking library needed).
+  (`httpx.MockTransport`, no extra mocking library needed). Runs with
+  `AUTHENTIK_MCP_MODE=write` (the superset) so `set_user_active` is covered
+  alongside everything read mode has.
 - `tests/test_http.py` — `/health`, `/ready`, and the bearer-auth middleware,
   via `server.build_app()` (the exact app `__main__` runs) through Starlette's
   `TestClient`.
+- `tests/test_mode.py` — the mode split itself, via subprocess (this
+  behavior only shows up at *import* time, so it can't be exercised by
+  monkeypatching an already-imported module): read mode genuinely lacking
+  `set_user_active`, write mode having it, per-mode port defaults, invalid
+  `AUTHENTIK_MCP_MODE` values exiting non-zero, and the `_READ`/`_WRITE`
+  credential fallback logic.
 - `tests/test_live_authentik.py` — **opt-in** contract tests against a real
   Authentik instance, to catch drift if an Authentik upgrade renames/removes
   a field these tools depend on (`pk`, `username`, `is_active`, `action`,

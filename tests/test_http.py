@@ -32,6 +32,7 @@ def test_ready_success(mock_authentik, no_auth):
         "status": "ok",
         "reachable": True,
         "authenticated": True,
+        "mode": server.AUTHENTIK_MCP_MODE,
         "authentik": {"url": server.AUTHENTIK_URL, "username": "svc-mcp"},
     }
 

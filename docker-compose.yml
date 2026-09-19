@@ -1,24 +1,27 @@
 services:
-  authentik-mcp:
+  # Always on. Cannot write anything — set_user_active doesn't exist in this
+  # process's tool registry at all when AUTHENTIK_MCP_MODE=read (see
+  # server.py's docstring). This is the container a client connects to for
+  # normal day-to-day lookups.
+  authentik-mcp-read:
     # Built and pushed by .github/workflows/ci.yml on every push to main.
     # Use `build: .` instead (and drop this `image:` line) if you'd rather
     # build locally from the Dockerfile — both work against this same file.
     image: ghcr.io/barrow1990/authentik-mcp-server:latest
-    container_name: authentik-mcp
-    # AUTHENTIK_URL / AUTHENTIK_API_TOKEN / MCP_AUTH_TOKEN are loaded from
-    # these files directly (not via `environment: ${VAR}` substitution, which
-    # `docker compose` only resolves against a plain `.env` — never against
-    # a Dockhand-managed one). Both files are optional and load in order,
-    # so whichever is present wins; if both are present, .env.dockhand wins
-    # for any key it also sets. This lets the same compose file work for a
-    # plain `.env` (see .env.example) and for Dockhand, which writes its own
-    # `.env.dockhand` from whatever you configure in its UI for this stack.
-    env_file:
-      - path: .env
-        required: false
-      - path: .env.dockhand
-        required: false
+    container_name: authentik-mcp-read
+    # ${VAR} substitution, not `env_file:` — each service names only the
+    # variables it actually needs, so e.g. this container's own environment
+    # never contains AUTHENTIK_API_TOKEN_WRITE or MCP_AUTH_TOKEN_WRITE even
+    # though both live in the same .env. Verify with `docker compose config`
+    # after editing .env. NOTE: this only reads a literal `.env` in this
+    # directory — if you deploy via Dockhand and it writes its UI config to
+    # a separate `.env.dockhand` instead, these values won't reach this
+    # stack; see README's "Does this fit Dockhand" section.
     environment:
+      AUTHENTIK_MCP_MODE: read
+      AUTHENTIK_URL: ${AUTHENTIK_URL:?}
+      AUTHENTIK_API_TOKEN_READ: ${AUTHENTIK_API_TOKEN_READ:?}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN_READ:-}
       MCP_HOST: 0.0.0.0
       MCP_PORT: 8937
     ports:
@@ -29,4 +32,27 @@ services:
       # and it holds a token that can read every user account in your
       # identity provider.
       - "8937:8937"
+    restart: unless-stopped
+
+  # NOT started by a plain `docker compose up -d` — only by
+  # `docker compose --profile write up -d`. This is deliberate: the write
+  # container existing at all is a decision to make each time you actually
+  # want an assistant to be able to flip a user's active flag, not a
+  # standing background service. Even when it is running, set_user_active
+  # still needs AUTHENTIK_ALLOW_WRITES=true AND confirm=True on the call
+  # itself — this profile gate is a third, independent layer on top of both.
+  authentik-mcp-write:
+    image: ghcr.io/barrow1990/authentik-mcp-server:latest
+    container_name: authentik-mcp-write
+    profiles: ["write"]
+    environment:
+      AUTHENTIK_MCP_MODE: write
+      AUTHENTIK_URL: ${AUTHENTIK_URL:?}
+      AUTHENTIK_API_TOKEN_WRITE: ${AUTHENTIK_API_TOKEN_WRITE:?}
+      AUTHENTIK_ALLOW_WRITES: ${AUTHENTIK_ALLOW_WRITES:-false}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN_WRITE:-}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8942
+    ports:
+      - "8942:8942"
     restart: unless-stopped

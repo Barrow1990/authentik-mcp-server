@@ -5,11 +5,19 @@ since the module requires both at import time (see server._require_env).
 Individual tests then swap server.client's transport to control what
 "Authentik" returns, via httpx.MockTransport — no extra mocking library
 needed, it ships in httpx (already a runtime dependency).
+
+AUTHENTIK_MCP_MODE defaults to "write" here (the superset) so this main
+suite can exercise set_user_active along with everything read mode has.
+The mode split itself — read mode genuinely lacking the tool, invalid mode
+values, port defaults — is covered separately in test_mode.py via
+subprocess, since that behavior only shows up at *import* time and this
+process has already imported server.py once with mode=write.
 """
 
 import os
 
 os.environ.setdefault("AUTHENTIK_URL", "http://test-authentik:9000")
+os.environ.setdefault("AUTHENTIK_MCP_MODE", "write")
 os.environ.setdefault("AUTHENTIK_API_TOKEN", "test-api-token")
 
 import httpx  # noqa: E402

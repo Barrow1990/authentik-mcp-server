@@ -73,15 +73,25 @@ WORKDIR /app
 
 USER app
 
-EXPOSE 8937
+# Both possible ports — which one is actually listening depends on
+# AUTHENTIK_MCP_MODE at runtime (read=8937, write=8942, either overridable
+# via MCP_PORT). A single image serves both modes; see server.py's docstring
+# and docker-compose.yml, which runs each mode as its own container from
+# this same image.
+EXPOSE 8937 8942
 
 # Liveness only (process up, HTTP serving) — not Authentik connectivity, so a
 # transient Authentik outage doesn't get Dockhand/Docker restarting this
 # container in a loop. Use GET /ready separately to check Authentik connectivity.
+# Mirrors server.py's own MCP_PORT default logic exactly (explicit MCP_PORT
+# wins; otherwise 8942 in write mode, 8937 otherwise) — this one line runs
+# unmodified in both the read and write containers, so it can't hardcode
+# either port.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "\
 import os, sys, urllib.request; \
-port = os.environ.get('MCP_PORT', '8937'); \
+mode = os.environ.get('AUTHENTIK_MCP_MODE', 'read').lower(); \
+port = os.environ.get('MCP_PORT') or ('8942' if mode == 'write' else '8937'); \
 sys.exit(0 if urllib.request.urlopen(f'http://localhost:{port}/health', timeout=3).status == 200 else 1)"]
 
 ENTRYPOINT ["python", "server.py"]
