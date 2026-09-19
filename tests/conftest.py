@@ -52,3 +52,9 @@ def with_auth(monkeypatch):
     token = "test-shared-secret"
     monkeypatch.setattr(server, "MCP_AUTH_TOKEN", token)
     return token
+
+
+@pytest.fixture
+def writes_enabled(monkeypatch):
+    """Run with AUTHENTIK_ALLOW_WRITES=true (the default, in tests, is False)."""
+    monkeypatch.setattr(server, "AUTHENTIK_ALLOW_WRITES", True)

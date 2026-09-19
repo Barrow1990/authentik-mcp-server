@@ -32,6 +32,11 @@ against a media manager, so this server is deliberately read-mostly:
   user's enabled/disabled flag. That's reversible (flip it back) and covers
   the actual homelab use case ("disable this account") without exposing
   anything sharper.
+- `set_user_active` is additionally gated by two independent opt-ins, both
+  off by default: `AUTHENTIK_ALLOW_WRITES=true` in the server's environment
+  (an operator decision), and `confirm=True` on the call itself (a per-call
+  decision). Either missing raises a clear error rather than silently doing
+  nothing — see Configuration below.
 - There is **no** create/delete tool for users, groups, applications,
   providers, or flows, and no tool that touches password hashes, tokens, or
   recovery links, even though Authentik's API supports all of that
@@ -116,6 +121,7 @@ Environment variables (see `.env.example`):
 |---|---|---|---|
 | `AUTHENTIK_URL` | yes | — | e.g. `http://192.168.1.50:9000` (or your reverse-proxied HTTPS URL) |
 | `AUTHENTIK_API_TOKEN` | yes | — | Bearer token from Directory > Tokens and App passwords |
+| `AUTHENTIK_ALLOW_WRITES` | no | `false` | Master switch for `set_user_active`. Must be `true` *and* the call must pass `confirm=True` — both gates are required |
 | `MCP_HOST` | no | `0.0.0.0` | Interface the server binds to inside the container |
 | `MCP_PORT` | no | `8937` | Port the server listens on |
 | `MCP_AUTH_TOKEN` | no | — | Shared secret required as `Authorization: Bearer <token>`. Unset = no auth (see above) |

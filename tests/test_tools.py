@@ -179,7 +179,7 @@ def test_recent_events_hits_correct_path_and_params(mock_authentik):
     ]
 
 
-def test_set_user_active_sends_patch(mock_authentik):
+def test_set_user_active_sends_patch(mock_authentik, writes_enabled):
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "PATCH"
         assert request.url.path == "/api/v3/core/users/7/"
@@ -188,9 +188,29 @@ def test_set_user_active_sends_patch(mock_authentik):
 
     mock_authentik(handler)
 
-    result = server.set_user_active(7, False)
+    result = server.set_user_active(7, False, confirm=True)
 
     assert result == "User 7 disabled"
+
+
+def test_set_user_active_blocked_without_allow_writes(mock_authentik):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("set_user_active must not call Authentik when writes are disabled")
+
+    mock_authentik(handler)
+
+    with pytest.raises(PermissionError, match="AUTHENTIK_ALLOW_WRITES"):
+        server.set_user_active(7, False, confirm=True)
+
+
+def test_set_user_active_blocked_without_confirm(mock_authentik, writes_enabled):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("set_user_active must not call Authentik without confirm=True")
+
+    mock_authentik(handler)
+
+    with pytest.raises(ValueError, match="confirm=True"):
+        server.set_user_active(7, False)
 
 
 def test_system_status_shapes_runtime_info(mock_authentik):

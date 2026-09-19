@@ -34,6 +34,16 @@ reversible, low-risk action. There is deliberately no create/delete tool for
 users, groups, applications, or anything else. See README.md's "Why no
 destructive tools" section.
 
+`set_user_active` — and any write tool added to this server in future — is
+gated by two independent opt-ins, neither of which is on by default:
+  1. AUTHENTIK_ALLOW_WRITES=true in the environment (server-level: the
+     operator running this container has to deliberately turn writes on).
+  2. confirm=True passed on the tool call itself (call-level: an assistant
+     can't trigger it via a misread instruction or a stale default; the
+     caller has to explicitly ask for the write, every time).
+Both are required. Missing either raises rather than silently no-op'ing, so
+a caller gets a clear reason instead of a confusing non-effect.
+
 Transport: streamable-http. This runs as a standing network service (bind
 0.0.0.0 inside the container; publish the port only on your internal
 network/VLAN — never forward it externally) rather than being spawned
@@ -69,6 +79,7 @@ def _require_env(name: str) -> str:
 
 AUTHENTIK_URL = _require_env("AUTHENTIK_URL").rstrip("/")
 AUTHENTIK_API_TOKEN = _require_env("AUTHENTIK_API_TOKEN")
+AUTHENTIK_ALLOW_WRITES = os.environ.get("AUTHENTIK_ALLOW_WRITES", "").lower() in ("1", "true", "yes")
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8937"))
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
@@ -189,8 +200,23 @@ def recent_events(username: str | None = None, action: str | None = None, limit:
 
 
 @mcp.tool()
-def set_user_active(user_id: int, is_active: bool) -> str:
-    """Enable or disable an Authentik user account. Reversible — does not delete anything."""
+def set_user_active(user_id: int, is_active: bool, confirm: bool = False) -> str:
+    """Enable or disable an Authentik user account. Reversible — does not delete anything.
+
+    Guarded: requires AUTHENTIK_ALLOW_WRITES=true in the server's environment
+    AND confirm=True on this call. Both are off by default; call with
+    confirm=True only once you actually mean to flip this user's access."""
+    if not AUTHENTIK_ALLOW_WRITES:
+        raise PermissionError(
+            "set_user_active is disabled: set AUTHENTIK_ALLOW_WRITES=true in the "
+            "server's environment to enable write tools on this server"
+        )
+    if not confirm:
+        raise ValueError(
+            "set_user_active requires confirm=True — this is a deliberate second "
+            "guard on top of AUTHENTIK_ALLOW_WRITES, not a bug"
+        )
+
     response = client.patch(f"/core/users/{user_id}/", json={"is_active": is_active})
     response.raise_for_status()
     state = "enabled" if is_active else "disabled"
